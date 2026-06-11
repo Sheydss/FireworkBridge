@@ -40,6 +40,8 @@ static constexpr uint32_t CHUNK_ACK_TIMEOUT   = 1000; // ms per chunk ACK
 static constexpr uint8_t  CHUNK_MAX_RETRIES   = 3;
 static constexpr uint8_t  MAX_HEADS           = 8;
 static constexpr uint8_t  MAX_TRANSFER_HEADS  = 8;
+// Head liveness: STATUS_INTERVAL_MS on the head is 2 s; 10 missed beats = 20 s
+static constexpr uint32_t HEAD_TIMEOUT_MS     = 20000;
 
 static const uint8_t k_broadcast[6] = { 0xFF,0xFF,0xFF,0xFF,0xFF,0xFF };
 
@@ -49,10 +51,11 @@ static const uint8_t k_broadcast[6] = { 0xFF,0xFF,0xFF,0xFF,0xFF,0xFF };
 
 struct HeadEntry
 {
-    uint8_t mac[6]   = {};
-    bool    active   = false;
-    int     state    = -1;
-    char    name[32] = {};
+    uint8_t  mac[6]      = {};
+    bool     active      = false;
+    int      state       = -1;
+    char     name[32]    = {};
+    uint32_t lastSeenMs  = 0;
 };
 
 static HeadEntry s_heads[MAX_HEADS];
@@ -116,6 +119,13 @@ struct TransferState
 static TransferState s_transfer;
 
 // ─────────────────────────────────────────────────────────────────────────────
+//  Last known state — replayed to heads that reconnect
+// ─────────────────────────────────────────────────────────────────────────────
+
+static int  s_currentState       = -1;
+static char s_currentFilename[64] = {};
+
+// ─────────────────────────────────────────────────────────────────────────────
 //  Serial input buffer
 // ─────────────────────────────────────────────────────────────────────────────
 
@@ -172,7 +182,8 @@ static HeadEntry* findOrAddHead(const uint8_t* mac)
         return nullptr;
 
     memcpy(s_heads[s_headCount].mac, mac, 6);
-    s_heads[s_headCount].active = true;
+    s_heads[s_headCount].active     = false; // activated on first announce
+    s_heads[s_headCount].lastSeenMs = millis();
     return &s_heads[s_headCount++];
 }
 
@@ -260,13 +271,20 @@ static void onEspNowReceived(const uint8_t* mac,
     ensurePeer(mac);
     HeadEntry* head = findOrAddHead(mac);
 
+    char macStr[18];
+    macToStr(mac, macStr, sizeof(macStr));
+
+    // Capture before any mutation: true for new heads and those that timed out.
+    const bool wasInactive = !head || !head->active;
+
+    if (head)
+        head->lastSeenMs = millis();
+
     JsonDocument doc;
     if (deserializeJson(doc, data, len) != DeserializationError::Ok)
         return;
 
     const char* type = doc["type"] | "";
-    char macStr[18];
-    macToStr(mac, macStr, sizeof(macStr));
 
     // ── Announce ──────────────────────────────────────────────────────────────
     if (strcmp(type, "announce") == 0)
@@ -277,16 +295,31 @@ static void onEspNowReceived(const uint8_t* mac,
             head->active = true;
         }
 
-        JsonDocument out;
-        out["type"] = "head_connected";
-        out["mac"]  = macStr;
-        out["name"] = doc["name"] | macStr;
-        sendToApp(out);
+        // Only do full initialisation for new / recovered heads.
+        // Periodic announces from already-active heads are silently ignored —
+        // acting on every announce would replay the state and restart the sequencer.
+        if (wasInactive)
+        {
+            JsonDocument out;
+            out["type"] = "head_connected";
+            out["mac"]  = macStr;
+            out["name"] = doc["name"] | macStr;
+            sendToApp(out);
 
-        // Request file list automatically on head detection
-        JsonDocument req;
-        req["cmd"] = "get_files";
-        sendToHead(mac, req);
+            JsonDocument req;
+            req["cmd"] = "get_files";
+            sendToHead(mac, req);
+
+            if (s_currentState >= 0)
+            {
+                JsonDocument stateMsg;
+                stateMsg["cmd"]   = "set_state";
+                stateMsg["state"] = s_currentState;
+                if (s_currentState == 2 && s_currentFilename[0] != '\0')
+                    stateMsg["filename"] = s_currentFilename;
+                sendToHead(mac, stateMsg);
+            }
+        }
     }
 
     // ── Status ────────────────────────────────────────────────────────────────
@@ -454,6 +487,13 @@ static void handleSetState(JsonDocument& doc)
         msg["filename"] = filename;
     }
 
+    // Remember for heads that reconnect later
+    s_currentState = stateVal;
+    if (stateVal == 2)
+        strlcpy(s_currentFilename, doc["filename"] | "", sizeof(s_currentFilename));
+    else
+        s_currentFilename[0] = '\0';
+
     String json;
     serializeJson(msg, json);
     ensurePeer(k_broadcast);
@@ -463,16 +503,16 @@ static void handleSetState(JsonDocument& doc)
 }
 
 static void handleJump(JsonDocument& doc) {
-    const int timeInTenth = doc["timeInTenth"] | 0;
-    
-    if(timeInTenth == 0) {
-        errorToApp("timeInTenth no valid");
+    if (doc["timeInTenths"].isNull()) {
+        errorToApp("jump: missing timeInTenths field");
         return;
     }
 
+    const int timeInTenths = doc["timeInTenths"].as<int>();
+
     JsonDocument msg;
-    msg["cmd"]   = "jump";
-    msg["timeInTenth"] = timeInTenth;
+    msg["cmd"]          = "jump";
+    msg["timeInTenths"] = timeInTenths;
 
     String json;
     serializeJson(msg, json);
@@ -490,6 +530,7 @@ static void handleGetHeads(JsonDocument&)
 
     for (uint8_t i = 0; i < s_headCount; ++i)
     {
+        if (!s_heads[i].active) continue;
         char macStr[18];
         macToStr(s_heads[i].mac, macStr, sizeof(macStr));
         JsonObject h = heads.add<JsonObject>();
@@ -690,6 +731,31 @@ static void readSerial()
 }
 
 // ─────────────────────────────────────────────────────────────────────────────
+//  Head heartbeat — called every loop()
+// ─────────────────────────────────────────────────────────────────────────────
+
+static void updateHeartbeat()
+{
+    const uint32_t now = millis();
+    for (uint8_t i = 0; i < s_headCount; ++i)
+    {
+        if (!s_heads[i].active) continue;
+        if (now - s_heads[i].lastSeenMs < HEAD_TIMEOUT_MS) continue;
+
+        s_heads[i].active = false;
+
+        char macStr[18];
+        macToStr(s_heads[i].mac, macStr, sizeof(macStr));
+        Serial.printf("[Bridge] Head %s timed out\n", macStr);
+
+        JsonDocument out;
+        out["type"] = "head_inactive";
+        out["mac"]  = macStr;
+        sendToApp(out);
+    }
+}
+
+// ─────────────────────────────────────────────────────────────────────────────
 //  setup / loop
 // ─────────────────────────────────────────────────────────────────────────────
 
@@ -700,6 +766,7 @@ void setup()
 
     WiFi.mode(WIFI_STA);
     WiFi.disconnect();
+    esp_wifi_set_protocol(WIFI_IF_STA, WIFI_PROTOCOL_LR);
     esp_wifi_set_channel(ESPNOW_CHANNEL, WIFI_SECOND_CHAN_NONE);
 
     if (esp_now_init() != ESP_OK)
@@ -719,5 +786,6 @@ void loop()
 {
     readSerial();
     updateTransfer();
+    updateHeartbeat();
     delay(1);
 }

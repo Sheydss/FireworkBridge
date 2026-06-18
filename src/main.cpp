@@ -42,6 +42,9 @@ static constexpr uint8_t  MAX_HEADS           = 8;
 static constexpr uint8_t  MAX_TRANSFER_HEADS  = 8;
 // Head liveness: STATUS_INTERVAL_MS on the head is 2 s; 10 missed beats = 20 s
 static constexpr uint32_t HEAD_TIMEOUT_MS     = 20000;
+// State retry: resend state to reconnecting heads in case of packet loss
+static constexpr uint8_t  STATE_RETRY_COUNT   = 2;
+static constexpr uint32_t STATE_RETRY_MS      = 150;
 
 static const uint8_t k_broadcast[6] = { 0xFF,0xFF,0xFF,0xFF,0xFF,0xFF };
 
@@ -60,6 +63,18 @@ struct HeadEntry
 
 static HeadEntry s_heads[MAX_HEADS];
 static uint8_t   s_headCount = 0;
+
+// ─────────────────────────────────────────────────────────────────────────────
+//  State retry — resend state to a head that just reconnected
+// ─────────────────────────────────────────────────────────────────────────────
+
+struct StateRetry {
+    bool     active     = false;
+    uint8_t  mac[6]     = {};
+    uint32_t nextSendMs = 0;
+    uint8_t  remaining  = 0;
+};
+static StateRetry s_stateRetries[MAX_HEADS];
 
 // ─────────────────────────────────────────────────────────────────────────────
 //  File transfer state
@@ -122,8 +137,10 @@ static TransferState s_transfer;
 //  Last known state — replayed to heads that reconnect
 // ─────────────────────────────────────────────────────────────────────────────
 
-static int  s_currentState       = -1;
-static char s_currentFilename[64] = {};
+static int      s_currentState    = -1;
+static char     s_currentFilename[64] = {};
+static uint32_t s_playOffsetMs   = 0; // track position (ms) at last play/jump
+static uint32_t s_playStartMs    = 0; // millis() at that moment
 
 // ─────────────────────────────────────────────────────────────────────────────
 //  Serial input buffer
@@ -318,6 +335,17 @@ static void onEspNowReceived(const uint8_t* mac,
                 if (s_currentState == 2 && s_currentFilename[0] != '\0')
                     stateMsg["filename"] = s_currentFilename;
                 sendToHead(mac, stateMsg);
+
+                if (s_currentState == 2)
+                {
+                    uint32_t currentMs = s_playOffsetMs + (millis() - s_playStartMs);
+                    JsonDocument jumpMsg;
+                    jumpMsg["cmd"]          = "jump";
+                    jumpMsg["timeInTenths"] = (int)(currentMs / 100);
+                    sendToHead(mac, jumpMsg);
+                }
+
+                scheduleStateRetry(mac);
             }
         }
     }
@@ -490,7 +518,11 @@ static void handleSetState(JsonDocument& doc)
     // Remember for heads that reconnect later
     s_currentState = stateVal;
     if (stateVal == 2)
+    {
         strlcpy(s_currentFilename, doc["filename"] | "", sizeof(s_currentFilename));
+        s_playOffsetMs = 0;
+        s_playStartMs  = millis();
+    }
     else
         s_currentFilename[0] = '\0';
 
@@ -509,6 +541,9 @@ static void handleJump(JsonDocument& doc) {
     }
 
     const int timeInTenths = doc["timeInTenths"].as<int>();
+
+    s_playOffsetMs = (uint32_t)timeInTenths * 100;
+    s_playStartMs  = millis();
 
     JsonDocument msg;
     msg["cmd"]          = "jump";
@@ -731,6 +766,57 @@ static void readSerial()
 }
 
 // ─────────────────────────────────────────────────────────────────────────────
+//  State retry — called every loop()
+// ─────────────────────────────────────────────────────────────────────────────
+
+static void scheduleStateRetry(const uint8_t* mac)
+{
+    for (auto& r : s_stateRetries)
+    {
+        if (!r.active || memcmp(r.mac, mac, 6) == 0)
+        {
+            memcpy(r.mac, mac, 6);
+            r.active     = true;
+            r.nextSendMs = millis() + STATE_RETRY_MS;
+            r.remaining  = STATE_RETRY_COUNT;
+            return;
+        }
+    }
+}
+
+static void updateStateRetries()
+{
+    if (s_currentState < 0) return;
+
+    const uint32_t now = millis();
+    for (auto& r : s_stateRetries)
+    {
+        if (!r.active || now < r.nextSendMs) continue;
+
+        JsonDocument stateMsg;
+        stateMsg["cmd"]   = "set_state";
+        stateMsg["state"] = s_currentState;
+        if (s_currentState == 2 && s_currentFilename[0] != '\0')
+            stateMsg["filename"] = s_currentFilename;
+        sendToHead(r.mac, stateMsg);
+
+        if (s_currentState == 2)
+        {
+            uint32_t currentMs = s_playOffsetMs + (now - s_playStartMs);
+            JsonDocument jumpMsg;
+            jumpMsg["cmd"]          = "jump";
+            jumpMsg["timeInTenths"] = (int)(currentMs / 100);
+            sendToHead(r.mac, jumpMsg);
+        }
+
+        if (--r.remaining == 0)
+            r.active = false;
+        else
+            r.nextSendMs = now + STATE_RETRY_MS;
+    }
+}
+
+// ─────────────────────────────────────────────────────────────────────────────
 //  Head heartbeat — called every loop()
 // ─────────────────────────────────────────────────────────────────────────────
 
@@ -786,6 +872,7 @@ void loop()
 {
     readSerial();
     updateTransfer();
+    updateStateRetries();
     updateHeartbeat();
     delay(1);
 }

@@ -267,6 +267,57 @@ static void reportFailedHeads()
 }
 
 // ─────────────────────────────────────────────────────────────────────────────
+//  State retry — called every loop()
+// ─────────────────────────────────────────────────────────────────────────────
+
+static void scheduleStateRetry(const uint8_t* mac)
+{
+    for (auto& r : s_stateRetries)
+    {
+        if (!r.active || memcmp(r.mac, mac, 6) == 0)
+        {
+            memcpy(r.mac, mac, 6);
+            r.active     = true;
+            r.nextSendMs = millis() + STATE_RETRY_MS;
+            r.remaining  = STATE_RETRY_COUNT;
+            return;
+        }
+    }
+}
+
+static void updateStateRetries()
+{
+    if (s_currentState < 0) return;
+
+    const uint32_t now = millis();
+    for (auto& r : s_stateRetries)
+    {
+        if (!r.active || now < r.nextSendMs) continue;
+
+        JsonDocument stateMsg;
+        stateMsg["cmd"]   = "set_state";
+        stateMsg["state"] = s_currentState;
+        if (s_currentState == 2 && s_currentFilename[0] != '\0')
+            stateMsg["filename"] = s_currentFilename;
+        sendToHead(r.mac, stateMsg);
+
+        if (s_currentState == 2)
+        {
+            uint32_t currentMs = s_playOffsetMs + (now - s_playStartMs);
+            JsonDocument jumpMsg;
+            jumpMsg["cmd"]          = "jump";
+            jumpMsg["timeInTenths"] = (int)(currentMs / 100);
+            sendToHead(r.mac, jumpMsg);
+        }
+
+        if (--r.remaining == 0)
+            r.active = false;
+        else
+            r.nextSendMs = now + STATE_RETRY_MS;
+    }
+}
+
+// ─────────────────────────────────────────────────────────────────────────────
 //  ESP-NOW callbacks
 // ─────────────────────────────────────────────────────────────────────────────
 
@@ -310,6 +361,8 @@ static void onEspNowReceived(const uint8_t* mac,
         {
             strlcpy(head->name, doc["name"] | macStr, sizeof(head->name));
             head->active = true;
+            if (!doc["state"].isNull())
+                head->state = doc["state"].as<int>();
         }
 
         // Only do full initialisation for new / recovered heads.
@@ -762,57 +815,6 @@ static void readSerial()
         {
             s_serialBuf[s_serialLen++] = c;
         }
-    }
-}
-
-// ─────────────────────────────────────────────────────────────────────────────
-//  State retry — called every loop()
-// ─────────────────────────────────────────────────────────────────────────────
-
-static void scheduleStateRetry(const uint8_t* mac)
-{
-    for (auto& r : s_stateRetries)
-    {
-        if (!r.active || memcmp(r.mac, mac, 6) == 0)
-        {
-            memcpy(r.mac, mac, 6);
-            r.active     = true;
-            r.nextSendMs = millis() + STATE_RETRY_MS;
-            r.remaining  = STATE_RETRY_COUNT;
-            return;
-        }
-    }
-}
-
-static void updateStateRetries()
-{
-    if (s_currentState < 0) return;
-
-    const uint32_t now = millis();
-    for (auto& r : s_stateRetries)
-    {
-        if (!r.active || now < r.nextSendMs) continue;
-
-        JsonDocument stateMsg;
-        stateMsg["cmd"]   = "set_state";
-        stateMsg["state"] = s_currentState;
-        if (s_currentState == 2 && s_currentFilename[0] != '\0')
-            stateMsg["filename"] = s_currentFilename;
-        sendToHead(r.mac, stateMsg);
-
-        if (s_currentState == 2)
-        {
-            uint32_t currentMs = s_playOffsetMs + (now - s_playStartMs);
-            JsonDocument jumpMsg;
-            jumpMsg["cmd"]          = "jump";
-            jumpMsg["timeInTenths"] = (int)(currentMs / 100);
-            sendToHead(r.mac, jumpMsg);
-        }
-
-        if (--r.remaining == 0)
-            r.active = false;
-        else
-            r.nextSendMs = now + STATE_RETRY_MS;
     }
 }
 
